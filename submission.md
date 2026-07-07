@@ -151,3 +151,50 @@ each service file's responsibilities and tracing the route→service→model cal
 above. I verified every claim by reading the actual source and by reproducing each
 bug against the seeded database (and the existing pytest suite) myself before writing
 it down.
+
+---
+
+## Milestone 3 — Root Cause Analyses
+
+I fixed **four** of the five bugs (#1, #5, #4, #2) and investigated the fifth (#3),
+which I could not reproduce — the write-up for #3 explains why. Each fix is its own
+commit on `bugfix/mixtape`.
+
+### Issue #1 — My listening streak keeps resetting
+
+**How I reproduced it.** The seed data gives kenji a `listening_streak` of 12. The
+report says the reset happens only on Sundays, so the trigger is a *date condition*,
+not an input. I reproduced it deterministically with the existing test
+`test_streak_increments_on_sunday`, which listens on Saturday 2024-06-15
+(`weekday() == 5`) then Sunday 2024-06-16 (`weekday() == 6`) and asserts the streak
+goes 1 → 2. Before the fix it came back **1**: `assert 1 == 2`. So a Saturday→Sunday
+pair — two consecutive calendar days — was being treated as a skipped day.
+
+**How I found the root cause.** I traced the call chain from the reported endpoint:
+`GET /users/<id>/streak` → `get_streak()` just returns the stored value, so the streak
+must be corrupted at *write* time, not read time. Writes happen on
+`POST /songs/<id>/listen` → `record_listening_event()` → `update_listening_streak()`
+in [services/streak_service.py](services/streak_service.py). Reading that function,
+the increment branch is the only place a "consecutive day" decision is made:
+`elif days_since_last == 1 and today.weekday() != 6:`. The moment I saw the extra
+`and today.weekday() != 6` I was confident — `datetime.weekday()` returns **6 for
+Sunday**, so on Sundays the condition is `1 and False` → the `elif` is skipped and
+execution falls into the `else: user.listening_streak = 1` reset branch, even though
+exactly one day had passed.
+
+**The root cause.** The consecutive-day check was `days_since_last == 1 and
+today.weekday() != 6`. `days_since_last == 1` already correctly identifies
+"yesterday → today". The extra `today.weekday() != 6` clause has no legitimate reason
+to exist: it says "increment only if today is not Sunday." Because Python's
+`weekday()` numbers days Mon=0 … Sun=6, every listen made on a Sunday failed the
+condition, dropped through to the `else`, and reset the streak to 1 — which is exactly
+kenji's "12 → 1 on Sunday morning" report.
+
+**My fix and side-effect check.** I removed the `and today.weekday() != 6` clause so
+the branch is simply `elif days_since_last == 1:`. That restores the intended rule:
+one calendar day gap → increment, larger gap → reset. Side effects I checked: I ran
+the full `tests/test_streaks.py` suite (5 tests). All pass, including
+`test_streak_resets_after_skipped_day` (Monday→Wednesday still resets to 1) and
+`test_streak_does_not_double_count_same_day` — so the *other* side of the boundary
+(genuine skips still reset, same-day listens still hold) is intact. The fix touches
+only the one boolean condition.
