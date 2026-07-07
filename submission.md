@@ -269,3 +269,45 @@ and (c) updating an existing rating still notifies. All pass. I also confirmed t
 existing playlist-add notification path is untouched, and that the notification is
 created *after* the rating commit so a failed/invalid rating never generates a stray
 notification.
+
+### Issue #2 — "Friends Listening Now" shows people from yesterday
+
+**How I reproduced it.** The bug is time-of-day dependent, so I made "now" explicit. I
+created a single listening event for a friend (darius) timestamped **11pm the previous
+day**, froze the service's clock to **9am today**, and called
+`get_friends_listening_now()`. darius appeared in the feed — exactly nova's report of
+seeing an 11pm-last-night listen at 9am. I later pinned this down in
+[tests/test_feed.py](tests/test_feed.py) by monkeypatching `feed_service.datetime` to a
+fixed instant.
+
+**How I found the root cause.** Trace: `GET /feed/<id>/listening-now` →
+`get_friends_listening_now()` in [services/feed_service.py](services/feed_service.py).
+The query filters `ListeningEvent.listened_at >= cutoff`, so the definition of `cutoff`
+is the whole ballgame. It was `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD`
+with `RECENT_THRESHOLD = timedelta(hours=24)`. The moment I read that I was confident:
+subtracting 24 hours produces a *rolling* window, not a *calendar-day* boundary — which
+is precisely why "yesterday evening" content survives into the next morning.
+
+**The root cause.** The feed is specified as "friends who listened **today**," but the
+cutoff was computed as "24 hours ago." At 9am, `now - 24h` is 9am *yesterday*, so any
+listen after 9am yesterday — including one at 11pm last night — passes the filter. The
+window only clears an old listen once a full 24 hours have elapsed, which is why nova
+saw last night's activity "hang around until the same time the next day." The comparison
+against a sliding 24h delta, instead of against midnight of the current day, is the bug.
+
+**My fix and side-effect check.** I replaced the rolling threshold with the start of the
+current UTC calendar day:
+`now = datetime.now(timezone.utc); cutoff = now.replace(hour=0, minute=0, second=0,
+microsecond=0)`. I removed the now-unused `RECENT_THRESHOLD` constant and the
+`timedelta` import. Side effects: I added [tests/test_feed.py](tests/test_feed.py) with
+both boundary cases — (a) at 9am, an 11pm-yesterday listen is excluded; (b) at 11:59pm,
+an 8am-*same-day* listen is still included (so I didn't overcorrect into hiding today's
+earlier listens). I left `get_activity_feed()` in the same file untouched, since by
+design it is *not* recency-filtered (it returns the last N events regardless of age),
+so the fix is correctly scoped to the "listening now" feed only.
+
+> **Timezone note / known limitation.** "Today" is computed in UTC, matching how every
+> timestamp in the app is stored (`datetime.now(timezone.utc)`). A user in a non-UTC
+> timezone would see the day roll over at UTC midnight rather than their local midnight.
+> Fixing that properly needs a per-user timezone, which the data model doesn't have, so
+> UTC-day is the correct scope for this fix.
