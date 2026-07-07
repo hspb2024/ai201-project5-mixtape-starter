@@ -230,3 +230,42 @@ including `test_playlist_returns_songs_in_order` (order preserved: Track 1..5) a
 `test_empty_playlist_returns_empty_list`. The empty case is worth calling out because
 it's the other boundary: previously `[][:-1]` happened to return `[]` (correct by
 accident); after the fix `[]` still returns `[]`, so a 0-song playlist is unaffected.
+
+### Issue #4 — Notified on playlist-add but not on rating
+
+**How I reproduced it.** I took a song from the seed data (simone shared
+"Crown Heights Anthem"), had kenji rate it via `rate_song(kenji_id, song_id, 5)`, then
+called `get_notifications(sharer_id)`. The sharer had **0** notifications before and
+**0** after — the rating saved fine (a `Rating` row exists) but no notification was
+created. By contrast, calling `add_to_playlist()` for the same song *did* produce a
+notification, matching aaliya's "playlist add works, rating doesn't" report.
+
+**How I found the root cause.** The report itself is the navigation hint: playlist-add
+notifies, rating doesn't, so I compared the two sibling functions in the same file,
+[services/notification_service.py](services/notification_service.py). `add_to_playlist()`
+ends with a clear pattern: after committing, `if song.shared_by != added_by_user_id:
+create_notification(...)`. I then read `rate_song()` top to bottom: it validates the
+score, loads the song and rater, upserts the `Rating`, commits — and `return rating`.
+There is simply **no `create_notification()` call anywhere in it**. The absence,
+side-by-side with the working function, is what made me confident: this is an
+architectural omission, not a typo or a wrong value (which matches the brief's hint).
+
+**The root cause.** Notifications in this app are created imperatively as a side effect
+inside whichever service performs the interaction — there is no event/observer system
+that fires automatically. `add_to_playlist()` performs its side effect;
+`rate_song()` never had the equivalent call added, so rating a song persists the score
+but notifies no one. The rating being saved (and visible on the song) while the
+notification never appears is the exact symptom aaliya described.
+
+**My fix and side-effect check.** After the commit in `rate_song()`, I added the same
+guarded notification the playlist path uses:
+`if song.shared_by != user_id: create_notification(user_id=song.shared_by,
+notification_type="song_rated", body=f"{rater.username} rated your song '{song.title}'
+{score} stars.")`. The `song.shared_by != user_id` guard prevents self-notifications,
+matching `add_to_playlist()`'s behavior. Side-effect checks: I wrote a new regression
+suite [tests/test_notifications.py](tests/test_notifications.py) covering (a) rating a
+shared song notifies the sharer, (b) rating your *own* song does **not** notify you,
+and (c) updating an existing rating still notifies. All pass. I also confirmed the
+existing playlist-add notification path is untouched, and that the notification is
+created *after* the rating commit so a failed/invalid rating never generates a stray
+notification.
