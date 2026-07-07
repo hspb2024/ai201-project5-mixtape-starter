@@ -1,5 +1,66 @@
 # Project 5: Mixtape Bug Hunt — Submission
 
+**Repo branch:** https://github.com/hspb2024/ai201-project5-mixtape-starter/tree/bugfix/mixtape
+
+**Summary:** Fixed 4 of 5 bugs (#1 streak, #5 playlist, #4 rating notification, #2
+feed), each as its own `fix:` commit, and investigated + documented #3 (which does not
+reproduce). Added regression tests for the two bugs that lacked coverage. Full suite: 18
+passing.
+
+---
+
+## AI Usage
+
+I used **Claude Code** (Anthropic's CLI agent) throughout this project. Being honest
+about the collaboration: it did a lot of the mechanical navigation and drafting, and I
+directed it, made the judgment calls, and verified every claim by running the code. Here
+is specifically where and how it helped, and where I had to push back.
+
+### Codebase navigation (Milestone 1)
+- I had it **summarize each service file's responsibility** and produce the route →
+  service → model call chains in the codebase map. This was fast and accurate — the map's
+  two traced data flows (rating a song; listening → streak → feed) came out of that and I
+  confirmed each by reading the source.
+- Useful pattern: instead of asking "where's the bug," I asked it to explain *what a
+  function does and what could make it return an unexpected value*. That kept it in
+  "explain what's here" mode rather than "guess what's wrong" mode.
+
+### Debugging (Milestones 2–3)
+- **Reproduction first.** Before any fix, I had it write small throwaway scripts to
+  trigger each bug against the seeded DB (e.g., crafting an 11pm-yesterday listening
+  event and freezing "now" to 9am to reproduce the feed bug; rating a song and checking
+  the sharer's notifications). Reproducing before fixing caught the most important finding
+  below.
+- **The `weekday()` diagnosis (#1):** I confirmed with it that Python's
+  `datetime.weekday()` returns 6 for Sunday, which is what made the `!= 6` clause the
+  obvious culprit — then verified by running `test_streak_increments_on_sunday`.
+- **Comparing two code paths (#4):** asking "what's the structural difference between
+  `add_to_playlist` and `rate_song`?" surfaced the missing `create_notification()` call
+  cleanly.
+
+### Where the AI would have been wrong if I hadn't verified
+- **Issue #3 (search duplicates) is the key example.** The query does
+  `outerjoin(song_tags)`, which *looks exactly like* a classic duplicate-rows bug, and a
+  naive "find and fix the bug" prompt would confidently "fix" it and claim success. But
+  when I actually ran it, the search returned each song **once** and the existing test
+  already passed. Digging in, I found the reason: SQLAlchemy's legacy `Query.all()` API
+  auto-deduplicates entities by identity, so the join's extra rows collapse. I proved this
+  by running the raw joined statement (3 rows) vs `Query(Song).all()` (1 row). The lesson
+  the brief warns about held up literally: the AI's plausible diagnosis was *unverifiable
+  against the running code*, and only reproducing it revealed the bug was latent, not
+  live. I documented it honestly rather than claiming a behavior fix.
+- I also double-checked its boundary reasoning myself — e.g. confirming the streak still
+  resets after a genuine skipped day, and that the feed still includes an *earlier-today*
+  listen (not just excluding yesterday), so the fix didn't overcorrect.
+
+**Bottom line:** AI was excellent for navigation, summarization, reproduction scaffolding,
+and drafting these write-ups; it was unreliable exactly where the brief said it would be —
+diagnosing a bug from code that "looks wrong" without running it. Every root cause below
+was confirmed by me reproducing the behavior and reading the specific line, not by taking
+the AI's word for it.
+
+---
+
 ## Milestone 1 — Orientation & Codebase Map
 
 ### How the app is structured
