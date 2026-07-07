@@ -198,3 +198,35 @@ the full `tests/test_streaks.py` suite (5 tests). All pass, including
 `test_streak_does_not_double_count_same_day` — so the *other* side of the boundary
 (genuine skips still reset, same-day listens still hold) is intact. The fix touches
 only the one boolean condition.
+
+### Issue #5 — The last song in a playlist never shows up
+
+**How I reproduced it.** The seed data builds "Friday Energy" with 7 songs. I called
+`get_playlist_songs()` for it and counted **6** returned — always missing the
+highest-`position` song. The existing test `test_playlist_returns_all_songs` makes it
+deterministic: it seeds a 5-song playlist and asserts `len(songs) == 5`; before the
+fix it returned 4 (`assert 4 == 5`). darius's "adding a new song frees the previous
+one" observation matches perfectly: whichever song has the largest `position` is the
+one dropped, so adding a new song pushes the old last-song out of last place.
+
+**How I found the root cause.** Straight trace: `GET /playlists/<id>/songs` →
+`get_songs()` in [routes/playlists.py](routes/playlists.py) →
+`get_playlist_songs()` in [services/playlist_service.py](services/playlist_service.py).
+The function's docstring even says *"This function returns all songs in the playlist."*
+The query itself is correct — it joins `playlist_entries`, filters by playlist, and
+orders by `position`. The bug is the very last line: `return [song.to_dict() for song
+in songs[:-1]]`. The `[:-1]` slice was the giveaway — it drops the final element of an
+already-correct, position-ordered list.
+
+**The root cause.** `songs` is the full, correctly ordered list of playlist songs, but
+the return statement slices it with `[:-1]`, which returns every element *except the
+last one*. Because the query orders ascending by `position`, "the last one" is always
+the most recently added song — exactly the song darius saw missing. Nothing else was
+wrong: not the join, not the ordering, just the slice truncating the result.
+
+**My fix and side-effect check.** I changed `songs[:-1]` to `songs` so every row is
+serialized. Side effects: I ran `tests/test_playlists.py` (3 tests) — all pass,
+including `test_playlist_returns_songs_in_order` (order preserved: Track 1..5) and
+`test_empty_playlist_returns_empty_list`. The empty case is worth calling out because
+it's the other boundary: previously `[][:-1]` happened to return `[]` (correct by
+accident); after the fix `[]` still returns `[]`, so a 0-song playlist is unaffected.
