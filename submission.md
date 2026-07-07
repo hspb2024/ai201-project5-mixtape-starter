@@ -311,3 +311,49 @@ so the fix is correctly scoped to the "listening now" feed only.
 > timezone would see the day roll over at UTC midnight rather than their local midnight.
 > Fixing that properly needs a per-user timezone, which the data model doesn't have, so
 > UTC-day is the correct scope for this fix.
+
+### Issue #3 — Same song shows up twice in search (investigated; latent, not live)
+
+I'm documenting this one honestly: **I could not reproduce the duplicates against this
+codebase**, and I want to explain exactly why rather than claim a fix I can't
+demonstrate.
+
+**How I tried to reproduce it.** The seed data intentionally includes multi-tag songs
+("Crown Heights Anthem" has 3 tags). I ran `search_songs("Anthem")` — it returned the
+song **once**, not three times. The existing test `test_search_no_duplicates_multi_tag_song`
+also already passes on the starter code. So the reported symptom does not occur here.
+
+**How I found out why.** The query in
+[services/search_service.py](services/search_service.py) *does* look like a duplicate
+bug: `db.session.query(Song).outerjoin(song_tags, ...)`. An outer join against the tag
+association table emits one row per (song, tag) pair, so a 3-tag song produces 3 rows.
+To confirm what actually happens, I ran the join two ways against the seeded DB:
+
+```
+Raw joined rows for "Anthem" (q.statement) : 3
+Query(Song).all() results                  : 1
+```
+
+The join really does produce 3 rows — but this code uses SQLAlchemy's **legacy
+`Query` API**, and `Query.all()` applies *entity uniquing*: when you select a single
+mapped entity, it de-duplicates rows by primary-key identity before returning them. So
+the 3 joined rows collapse back to 1 `Song`. The duplication is created and then
+silently removed. (This is the one place the brief's "second code path" hint didn't map
+onto the code I was given — the uniquing layer, not a branch, is what suppresses it.)
+
+**The root cause (latent).** The `outerjoin(song_tags)` serves no purpose — tags aren't
+read from the join; they're loaded per-song by the `lazy="subquery"` relationship inside
+`Song.to_dict()`. The join only multiplies rows. It's a genuine latent defect: it would
+produce visible duplicates the instant someone rewrote this in SQLAlchemy 2.0 style
+(`db.session.execute(select(Song).join(song_tags))`, which does **not** auto-unique and
+requires an explicit `.unique()`), or added a second real column to the select.
+
+**My fix and side-effect check.** I removed the unnecessary `outerjoin` (and the now-
+unused `Tag`/`song_tags` imports) so the query selects `Song` directly. This eliminates
+the row multiplication at the source rather than relying on the uniquing layer to paper
+over it — the query is now correct and robust regardless of which SQLAlchemy API style
+is used. I verified all 5 tests in `tests/test_search.py` still pass (matching search,
+no-tag / one-tag / multi-tag each appear once, empty result for no match). Because this
+was a hardening change with no observable behavior difference on the current code, I've
+counted my three required fixes as #1, #5, #4 (plus #2), and treat #3 as a documented
+investigation.
